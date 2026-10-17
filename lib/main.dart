@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:math' show max;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(const ConvertisseurApp());
 
@@ -35,10 +37,11 @@ class ConvertisseurApp extends StatelessWidget {
 // ======================= DONNÉES =======================
 
 class TauxResultat {
-  TauxResultat(this.taux, this.miseAJour);
+  TauxResultat(this.taux, this.miseAJour, this.prochaine);
 
   final Map<String, double> taux;
   final String miseAJour;
+  final String prochaine;
 }
 
 Future<TauxResultat> chargerTaux() async {
@@ -59,7 +62,42 @@ Future<TauxResultat> chargerTaux() async {
   final taux =
       brut.map((cle, valeur) => MapEntry(cle, (valeur as num).toDouble()));
 
-  return TauxResultat(taux, json['time_last_update_utc'] as String);
+  return TauxResultat(
+    taux,
+    json['time_last_update_utc']?.toString() ?? '',
+    json['time_next_update_utc']?.toString() ?? '',
+  );
+}
+
+// Une alerte : prévenir quand le taux de->vers passe au-dessus / en dessous
+class Alerte {
+  Alerte({
+    required this.de,
+    required this.vers,
+    required this.seuil,
+    required this.auDessus,
+  });
+
+  final String de;
+  final String vers;
+  final double seuil;
+  final bool auDessus;
+
+  bool declenchee(double taux) => auDessus ? taux >= seuil : taux <= seuil;
+
+  Map<String, dynamic> toJson() => {
+        'de': de,
+        'vers': vers,
+        'seuil': seuil,
+        'auDessus': auDessus,
+      };
+
+  factory Alerte.fromJson(Map<String, dynamic> j) => Alerte(
+        de: j['de'] as String,
+        vers: j['vers'] as String,
+        seuil: (j['seuil'] as num).toDouble(),
+        auDessus: j['auDessus'] as bool,
+      );
 }
 
 class InfoDevise {
@@ -253,31 +291,109 @@ class PageConvertisseur extends StatefulWidget {
 
 class _PageConvertisseurState extends State<PageConvertisseur> {
   final TextEditingController _montantCtrl = TextEditingController(text: '100');
+
+  // Onglet Frais : deux services à comparer
+  final TextEditingController _fixeA = TextEditingController(text: '2');
+  final TextEditingController _pctA = TextEditingController(text: '1');
+  final TextEditingController _margeA = TextEditingController(text: '0');
+  final TextEditingController _fixeB = TextEditingController(text: '0');
+  final TextEditingController _pctB = TextEditingController(text: '0');
+  final TextEditingController _margeB = TextEditingController(text: '3');
+
+  // Onglet Alertes : formulaire de création
+  final TextEditingController _seuilCtrl = TextEditingController();
+  String _alDe = 'EUR';
+  String _alVers = 'XOF';
+  bool _alAuDessus = true;
+
   final NumberFormat _fmt0 = NumberFormat.decimalPattern('fr_FR');
   final NumberFormat _fmt2 =
       NumberFormat.decimalPatternDigits(locale: 'fr_FR', decimalDigits: 2);
   final NumberFormat _fmt4 =
       NumberFormat.decimalPatternDigits(locale: 'fr_FR', decimalDigits: 4);
 
+  SharedPreferences? _prefs;
+
   TauxResultat? _donnees;
   bool _chargement = true;
   String? _erreur;
+  bool _bandeauMasque = false;
 
+  int _onglet = 0;
   String _de = 'EUR';
   String _vers = 'XOF';
   double _tours = 0;
 
+  List<String> _cibles = ['XOF', 'USD', 'GBP', 'MAD', 'KMF'];
+  List<Alerte> _alertes = [];
+
   @override
   void initState() {
     super.initState();
-    _recharger();
+    _demarrer();
   }
 
   @override
   void dispose() {
     _montantCtrl.dispose();
+    _fixeA.dispose();
+    _pctA.dispose();
+    _margeA.dispose();
+    _fixeB.dispose();
+    _pctB.dispose();
+    _margeB.dispose();
+    _seuilCtrl.dispose();
     super.dispose();
   }
+
+  // ---------- Mémorisation ----------
+
+  Future<void> _demarrer() async {
+    await _chargerPrefs();
+    await _recharger();
+  }
+
+  Future<void> _chargerPrefs() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      _prefs = p;
+      _de = p.getString('de') ?? _de;
+      _vers = p.getString('vers') ?? _vers;
+      final montant = p.getString('montant');
+      if (montant != null) _montantCtrl.text = montant;
+      final cibles = p.getStringList('cibles');
+      if (cibles != null) _cibles = List<String>.from(cibles);
+      final alertes = p.getStringList('alertes') ?? [];
+      _alertes = alertes
+          .map((s) => Alerte.fromJson(jsonDecode(s) as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      // Si le stockage est indisponible, on garde les valeurs par défaut.
+    }
+  }
+
+  Future<void> _sauver() async {
+    final p = _prefs;
+    if (p == null) return;
+    try {
+      await p.setString('de', _de);
+      await p.setString('vers', _vers);
+      await p.setString('montant', _montantCtrl.text);
+      await p.setStringList('cibles', _cibles);
+      await p.setStringList(
+        'alertes',
+        _alertes.map((a) => jsonEncode(a.toJson())).toList(),
+      );
+    } catch (_) {}
+  }
+
+  // setState + sauvegarde
+  void _maj(VoidCallback f) {
+    setState(f);
+    _sauver();
+  }
+
+  // ---------- Logique ----------
 
   Future<void> _recharger() async {
     setState(() {
@@ -290,6 +406,10 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
       setState(() {
         _donnees = resultat;
         _chargement = false;
+        _bandeauMasque = false;
+        // Sécurité : si une devise mémorisée n'existe plus, on revient au défaut
+        if (!resultat.taux.containsKey(_de)) _de = 'EUR';
+        if (!resultat.taux.containsKey(_vers)) _vers = 'XOF';
       });
     } catch (e) {
       if (!mounted) return;
@@ -304,28 +424,34 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
     return infosDevises.keys.where(_donnees!.taux.containsKey).toList();
   }
 
-  Future<void> _choisirDevise({required bool source}) async {
-    final choix = await showModalBottomSheet<String>(
+  Future<String?> _ouvrirChoix(String selection) {
+    return showModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
       builder: (_) => FeuilleDevises(
         devises: _devisesDispo(),
-        selection: source ? _de : _vers,
+        selection: selection,
       ),
     );
+  }
+
+  Future<void> _choisir(String courant, void Function(String) appliquer) async {
+    final choix = await _ouvrirChoix(courant);
     if (choix == null || !mounted) return;
-    setState(() {
-      if (source) {
-        _de = choix;
-      } else {
-        _vers = choix;
-      }
+    _maj(() => appliquer(choix));
+  }
+
+  Future<void> _ajouterCible() async {
+    final choix = await _ouvrirChoix('');
+    if (choix == null || !mounted) return;
+    _maj(() {
+      if (!_cibles.contains(choix)) _cibles.add(choix);
     });
   }
 
   void _inverser() {
-    setState(() {
+    _maj(() {
       final temp = _de;
       _de = _vers;
       _vers = temp;
@@ -339,22 +465,100 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
     return taux[vers]! / taux[de]!;
   }
 
+  double? _montant() {
+    return double.tryParse(_montantCtrl.text.replaceAll(',', '.'));
+  }
+
+  double _num(TextEditingController c) {
+    return double.tryParse(c.text.replaceAll(',', '.')) ?? 0;
+  }
+
+  // Montant reçu après frais fixes, frais en % et marge sur le taux
+  double? _recu(
+    double? montant,
+    double? taux,
+    TextEditingController fixe,
+    TextEditingController pct,
+    TextEditingController marge,
+  ) {
+    if (montant == null || taux == null) return null;
+    final net = max(0.0, montant - _num(fixe) - montant * _num(pct) / 100);
+    return net * taux * (1 - _num(marge) / 100);
+  }
+
+  List<(Alerte, double)> _declenchees() {
+    final resultat = <(Alerte, double)>[];
+    for (final a in _alertes) {
+      final t = _tauxEntre(a.de, a.vers);
+      if (t != null && a.declenchee(t)) resultat.add((a, t));
+    }
+    return resultat;
+  }
+
+  void _creerAlerte() {
+    final seuil = double.tryParse(_seuilCtrl.text.replaceAll(',', '.'));
+    if (seuil == null || seuil <= 0 || _alDe == _alVers) {
+      _message('Vérifie la paire de devises et le seuil');
+      return;
+    }
+    _maj(() {
+      _alertes.add(
+        Alerte(de: _alDe, vers: _alVers, seuil: seuil, auDessus: _alAuDessus),
+      );
+      _bandeauMasque = false;
+    });
+    _seuilCtrl.clear();
+    _message('Alerte créée');
+  }
+
+  void _message(String texte) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(texte), duration: const Duration(seconds: 2)),
+    );
+  }
+
   Future<void> _copier(double valeur) async {
     await Clipboard.setData(ClipboardData(text: valeur.toStringAsFixed(2)));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Résultat copié'),
-        duration: Duration(seconds: 1),
-      ),
-    );
+    _message('Résultat copié');
   }
 
   // ---------- Structure générale ----------
 
   @override
   Widget build(BuildContext context) {
+    final pret = !_chargement && _erreur == null && _donnees != null;
+    final nbAlertes = pret ? _declenchees().length : 0;
+
     return Scaffold(
+      bottomNavigationBar: pret
+          ? NavigationBar(
+              selectedIndex: _onglet,
+              onDestinationSelected: (i) => setState(() => _onglet = i),
+              destinations: [
+                const NavigationDestination(
+                  icon: Icon(Icons.currency_exchange),
+                  label: 'Convertir',
+                ),
+                const NavigationDestination(
+                  icon: Icon(Icons.list_alt),
+                  label: 'Multi',
+                ),
+                const NavigationDestination(
+                  icon: Icon(Icons.receipt_long),
+                  label: 'Frais',
+                ),
+                NavigationDestination(
+                  icon: Badge(
+                    isLabelVisible: nbAlertes > 0,
+                    label: Text('$nbAlertes'),
+                    child: const Icon(Icons.notifications_outlined),
+                  ),
+                  label: 'Alertes',
+                ),
+              ],
+            )
+          : null,
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
@@ -379,12 +583,7 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
                       children: [
                         _entete(),
                         const SizedBox(height: 20),
-                        if (_chargement)
-                          _vueChargement()
-                        else if (_erreur != null)
-                          _vueErreur()
-                        else
-                          _vueConvertisseur(),
+                        _contenu(),
                       ],
                     ),
                   ),
@@ -394,6 +593,23 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _contenu() {
+    if (_chargement) return _vueChargement();
+    if (_erreur != null) return _vueErreur();
+
+    final onglet = switch (_onglet) {
+      1 => _ongletMulti(),
+      2 => _ongletFrais(),
+      3 => _ongletAlertes(),
+      _ => _ongletConvertir(),
+    };
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [_bandeauAlertes(), onglet],
     );
   }
 
@@ -498,10 +714,63 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
     );
   }
 
-  // ---------- Écran principal avec les taux ----------
+  // Bandeau affiché au-dessus de tous les onglets quand un seuil est franchi
+  Widget _bandeauAlertes() {
+    final liste = _declenchees();
+    if (liste.isEmpty || _bandeauMasque) return const SizedBox.shrink();
 
-  Widget _vueConvertisseur() {
-    final montant = double.tryParse(_montantCtrl.text.replaceAll(',', '.'));
+    const texte = Color(0xFF5C4400);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 12, 4, 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFFF3CD),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Icon(Icons.notifications_active, color: Color(0xFF8A5A00)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Alerte de taux',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      color: texte,
+                    ),
+                  ),
+                  for (final (a, t) in liste)
+                    Text(
+                      '${a.de} → ${a.vers} : ${_fmt4.format(t)} '
+                      '(seuil ${a.auDessus ? '≥' : '≤'} ${_fmt4.format(a.seuil)})',
+                      style: const TextStyle(color: texte),
+                    ),
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: 'Masquer',
+              icon: const Icon(Icons.close, color: texte),
+              onPressed: () => setState(() => _bandeauMasque = true),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ======================= ONGLET 1 : CONVERTIR =======================
+
+  Widget _ongletConvertir() {
+    final montant = _montant();
     final tauxEntre = _tauxEntre(_de, _vers);
     final resultat =
         (montant != null && tauxEntre != null) ? montant * tauxEntre : null;
@@ -514,7 +783,6 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        // Paires populaires
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: Row(
@@ -522,8 +790,6 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
           ),
         ),
         const SizedBox(height: 16),
-
-        // Carte de conversion
         TweenAnimationBuilder<double>(
           tween: Tween(begin: 0, end: 1),
           duration: const Duration(milliseconds: 500),
@@ -549,29 +815,8 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _montantCtrl,
-                          keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true,
-                          ),
-                          inputFormatters: [
-                            FilteringTextInputFormatter.allow(
-                              RegExp(r'[0-9.,]'),
-                            ),
-                          ],
-                          style: const TextStyle(
-                            fontSize: 30,
-                            fontWeight: FontWeight.w700,
-                          ),
-                          decoration: const InputDecoration(
-                            border: InputBorder.none,
-                            hintText: '0',
-                          ),
-                          onChanged: (_) => setState(() {}),
-                        ),
-                      ),
-                      _pilule(_de, () => _choisirDevise(source: true)),
+                      Expanded(child: _champMontant()),
+                      _pilule(_de, () => _choisir(_de, (c) => _de = c)),
                     ],
                   ),
                   const SizedBox(height: 4),
@@ -580,7 +825,7 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
                     children: [10, 100, 1000, 10000].map((valeur) {
                       return ActionChip(
                         label: Text(_fmt0.format(valeur)),
-                        onPressed: () => setState(
+                        onPressed: () => _maj(
                           () => _montantCtrl.text = valeur.toString(),
                         ),
                       );
@@ -635,7 +880,7 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
                           icon: const Icon(Icons.copy_rounded),
                           onPressed: () => _copier(resultat),
                         ),
-                      _pilule(_vers, () => _choisirDevise(source: false)),
+                      _pilule(_vers, () => _choisir(_vers, (c) => _vers = c)),
                     ],
                   ),
                 ],
@@ -643,10 +888,7 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
             ),
           ),
         ),
-
         const SizedBox(height: 20),
-
-        // Taux
         if (tauxEntre != null)
           Container(
             padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
@@ -676,11 +918,422 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
             ),
           ),
         const SizedBox(height: 16),
-        Text(
-          'Dernière mise à jour : ${_donnees!.miseAJour}',
-          textAlign: TextAlign.center,
-          style: const TextStyle(color: Colors.white70, fontSize: 12),
+        _pied(),
+      ],
+    );
+  }
+
+  // ======================= ONGLET 2 : MULTI =======================
+
+  Widget _ongletMulti() {
+    final montant = _montant();
+    final cibles = _cibles
+        .where((c) => c != _de && _donnees!.taux.containsKey(c))
+        .toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _carteSource(),
+        const SizedBox(height: 16),
+        Card(
+          elevation: 8,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              children: [
+                if (cibles.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Text('Ajoute une devise avec le bouton ci-dessous'),
+                  ),
+                for (final code in cibles) _ligneMulti(code, montant),
+              ],
+            ),
+          ),
         ),
+        const SizedBox(height: 12),
+        FilledButton.tonalIcon(
+          onPressed: _ajouterCible,
+          icon: const Icon(Icons.add),
+          label: const Text('Ajouter une devise'),
+        ),
+        const SizedBox(height: 16),
+        _pied(),
+      ],
+    );
+  }
+
+  Widget _ligneMulti(String code, double? montant) {
+    final taux = _tauxEntre(_de, code);
+    final valeur = (montant != null && taux != null) ? montant * taux : null;
+
+    return ListTile(
+      leading: BadgeDevise(code: code, taille: 40),
+      title: Text(
+        valeur == null ? '—' : '${_fmt2.format(valeur)} $code',
+        style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 17),
+      ),
+      subtitle: Text(infosDevises[code]?.nom ?? code),
+      trailing: IconButton(
+        tooltip: 'Retirer',
+        icon: const Icon(Icons.close),
+        onPressed: () => _maj(() => _cibles.remove(code)),
+      ),
+    );
+  }
+
+  // ======================= ONGLET 3 : FRAIS =======================
+
+  Widget _ongletFrais() {
+    final montant = _montant();
+    final taux = _tauxEntre(_de, _vers);
+    final base = (montant != null && taux != null) ? montant * taux : null;
+
+    final recuA = _recu(montant, taux, _fixeA, _pctA, _margeA);
+    final recuB = _recu(montant, taux, _fixeB, _pctB, _margeB);
+
+    String? meilleur;
+    if (recuA != null && recuB != null && recuA != recuB) {
+      meilleur = recuA > recuB ? 'A' : 'B';
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _carteSource(destination: true),
+        const SizedBox(height: 16),
+        _carteService(
+            'Service A', _fixeA, _pctA, _margeA, recuA, base, meilleur == 'A'),
+        const SizedBox(height: 12),
+        _carteService(
+            'Service B', _fixeB, _pctB, _margeB, recuB, base, meilleur == 'B'),
+        const SizedBox(height: 12),
+        const Text(
+          'Marge = écart entre le taux du service et le taux du jour. '
+          'Elle est souvent cachée dans le taux proposé : compare toujours '
+          'le montant final reçu.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white70, fontSize: 12),
+        ),
+        const SizedBox(height: 16),
+        _pied(),
+      ],
+    );
+  }
+
+  Widget _carteService(
+    String titre,
+    TextEditingController fixe,
+    TextEditingController pct,
+    TextEditingController marge,
+    double? recu,
+    double? base,
+    bool meilleur,
+  ) {
+    final cout = (recu != null && base != null) ? base - recu : null;
+    final coutPct =
+        (cout != null && base != null && base > 0) ? cout / base * 100 : null;
+    final couleurs = Theme.of(context).colorScheme;
+
+    return Card(
+      elevation: 8,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    titre,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                if (meilleur)
+                  Chip(
+                    avatar: Icon(
+                      Icons.emoji_events,
+                      size: 18,
+                      color: couleurs.primary,
+                    ),
+                    label: const Text('Meilleure offre'),
+                    visualDensity: VisualDensity.compact,
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(child: _champ(fixe, 'Fixe ($_de)')),
+                const SizedBox(width: 8),
+                Expanded(child: _champ(pct, 'Frais %')),
+                const SizedBox(width: 8),
+                Expanded(child: _champ(marge, 'Marge %')),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _etiquette('Le bénéficiaire reçoit'),
+            const SizedBox(height: 4),
+            Text(
+              recu == null ? '—' : '${_fmt2.format(recu)} $_vers',
+              style: TextStyle(
+                fontSize: 26,
+                fontWeight: FontWeight.w800,
+                color: couleurs.primary,
+              ),
+            ),
+            if (cout != null && coutPct != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                'Coût total : ${_fmt2.format(cout)} $_vers '
+                '(${_fmt2.format(coutPct)} %)',
+                style: TextStyle(color: couleurs.onSurfaceVariant),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ======================= ONGLET 4 : ALERTES =======================
+
+  Widget _ongletAlertes() {
+    final couleurs = Theme.of(context).colorScheme;
+    final tauxActuel = _tauxEntre(_alDe, _alVers);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Card(
+          elevation: 8,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Nouvelle alerte',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 12),
+                _etiquette('Paire à surveiller'),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    _pilule(_alDe, () => _choisir(_alDe, (c) => _alDe = c)),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 8),
+                      child: Icon(Icons.arrow_forward, size: 20),
+                    ),
+                    _pilule(
+                      _alVers,
+                      () => _choisir(_alVers, (c) => _alVers = c),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                _etiquette('Me prévenir quand le taux est'),
+                const SizedBox(height: 6),
+                SegmentedButton<bool>(
+                  segments: const [
+                    ButtonSegment(value: true, label: Text('Au-dessus')),
+                    ButtonSegment(value: false, label: Text('En dessous')),
+                  ],
+                  selected: {_alAuDessus},
+                  onSelectionChanged: (s) =>
+                      setState(() => _alAuDessus = s.first),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: _seuilCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  inputFormatters: [
+                    FilteringTextInputFormatter.allow(RegExp(r'[0-9.,]')),
+                  ],
+                  decoration: InputDecoration(
+                    labelText: 'Seuil',
+                    helperText: tauxActuel == null
+                        ? null
+                        : 'Taux actuel : 1 $_alDe = '
+                            '${_fmt4.format(tauxActuel)} $_alVers',
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _creerAlerte,
+                    icon: const Icon(Icons.add_alert),
+                    label: const Text('Créer l\'alerte'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Card(
+          elevation: 8,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(28),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              children: [
+                if (_alertes.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Text(
+                      'Aucune alerte pour le moment',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                for (var i = 0; i < _alertes.length; i++)
+                  _ligneAlerte(i, couleurs),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const Text(
+          'Les alertes sont vérifiées à l\'ouverture de l\'app et à chaque '
+          'actualisation. Les taux n\'étant mis à jour qu\'une fois par jour, '
+          'aucune notification n\'est envoyée quand l\'app est fermée.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white70, fontSize: 12),
+        ),
+        const SizedBox(height: 16),
+        _pied(),
+      ],
+    );
+  }
+
+  Widget _ligneAlerte(int index, ColorScheme couleurs) {
+    final a = _alertes[index];
+    final taux = _tauxEntre(a.de, a.vers);
+    final declenchee = taux != null && a.declenchee(taux);
+
+    return ListTile(
+      leading: Icon(
+        declenchee ? Icons.notifications_active : Icons.notifications_none,
+        color: declenchee ? Colors.orange : couleurs.onSurfaceVariant,
+      ),
+      title: Text(
+        '${a.de} → ${a.vers}  ${a.auDessus ? '≥' : '≤'}  ${_fmt4.format(a.seuil)}',
+        style: const TextStyle(fontWeight: FontWeight.w700),
+      ),
+      subtitle: Text(
+        taux == null
+            ? 'Taux indisponible'
+            : 'Actuel : ${_fmt4.format(taux)}'
+                '${declenchee ? '  ·  seuil atteint' : ''}',
+        style: TextStyle(color: declenchee ? Colors.orange.shade800 : null),
+      ),
+      trailing: IconButton(
+        tooltip: 'Supprimer',
+        icon: const Icon(Icons.delete_outline),
+        onPressed: () => _maj(() => _alertes.removeAt(index)),
+      ),
+    );
+  }
+
+  // ======================= COMPOSANTS COMMUNS =======================
+
+  Widget _champMontant() {
+    return TextField(
+      controller: _montantCtrl,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.,]'))],
+      style: const TextStyle(fontSize: 30, fontWeight: FontWeight.w700),
+      decoration: const InputDecoration(
+        border: InputBorder.none,
+        hintText: '0',
+      ),
+      onChanged: (_) => _maj(() {}),
+    );
+  }
+
+  Widget _champ(TextEditingController c, String label) {
+    return TextField(
+      controller: c,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.,]'))],
+      decoration: InputDecoration(
+        labelText: label,
+        isDense: true,
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+      onChanged: (_) => setState(() {}),
+    );
+  }
+
+  // Carte "Montant + devise" des onglets Multi et Frais
+  Widget _carteSource({bool destination = false}) {
+    return Card(
+      elevation: 8,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _etiquette(destination ? 'J\'envoie' : 'Montant'),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Expanded(child: _champMontant()),
+                _pilule(_de, () => _choisir(_de, (c) => _de = c)),
+              ],
+            ),
+            if (destination) ...[
+              const SizedBox(height: 8),
+              _etiquette('Vers'),
+              const SizedBox(height: 4),
+              _pilule(_vers, () => _choisir(_vers, (c) => _vers = c)),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _pied() {
+    final d = _donnees!;
+    return Column(
+      children: [
+        if (d.miseAJour.isNotEmpty)
+          Text(
+            'Dernière mise à jour : ${d.miseAJour}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+        if (d.prochaine.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Prochaine mise à jour : ${d.prochaine}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+        ],
         const SizedBox(height: 4),
         const Text(
           'Taux indicatifs fournis par exchangerate-api.com',
@@ -690,8 +1343,6 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
       ],
     );
   }
-
-  // ---------- Petits composants ----------
 
   Widget _etiquette(String texte) {
     return Text(
@@ -743,7 +1394,7 @@ class _PageConvertisseurState extends State<PageConvertisseur> {
         borderRadius: BorderRadius.circular(20),
         child: InkWell(
           borderRadius: BorderRadius.circular(20),
-          onTap: () => setState(() {
+          onTap: () => _maj(() {
             _de = de;
             _vers = vers;
           }),
